@@ -30,6 +30,7 @@
 - **Time-bounded submission** — `SubmitBefore` with a deadline window.
 - **Graceful shutdown** — `Wait` blocks until all in-flight tasks complete; `Close` stops new submissions.
 - **Custom logger** — plug any `Printf`/`Println` implementation (e.g. `zap.SugaredLogger`).
+- **Lifecycle hooks** — `hook.NewHooks()` dispatches Submitted / Enqueued / Started / Completed / PoolClosed callbacks; panicking callbacks are isolated and logged.
 
 ## Installation
 
@@ -247,6 +248,35 @@ Replace the default `log.Default()` logger with any implementation of `Printf`/`
 pool.SetLogger(log.Default())       // stdlib
 pool.SetLogger(zapLogger.Sugar())   // zap
 ```
+
+## Lifecycle Hooks
+
+The `hook` package ships the default dispatcher for the five lifecycle events. Register callbacks before submitting tasks, then install it with `SetHook`:
+
+```go
+import (
+	"context"
+
+	agilepool "github.com/Yiming1997/agilePool/v2"
+	"github.com/Yiming1997/agilePool/v2/hook"
+)
+
+h := hook.NewHooks()
+h.AddTaskSubmitted(func(ctx context.Context) { /* submitted */ })
+h.AddTaskEnqueued(func(ctx context.Context)  { /* enqueued */ })
+h.AddTaskStarted(func(ctx context.Context)   { /* started */ })
+h.AddTaskCompleted(func(ctx context.Context, recovered any) {
+	// recovered is nil on normal exit, otherwise the value passed to panic.
+})
+h.AddPoolClosed(func(p *agilepool.Pool) { /* closed */ })
+pool.SetHook(h)
+```
+
+- Callbacks run in the goroutine that triggers the event: the submitting goroutine for `Submitted`/`Enqueued`, a worker for `Started`/`Completed`, and the `Close` caller for `PoolClosed`.
+- A panicking callback is recovered and logged; the remaining callbacks of that event still run.
+- `Enqueued` fires exactly once per accepted task. On the overflow-buffer path it is dispatched after the buffer lock is released, so it may be observed after `Started` (or even `Completed`); ordering between lifecycle events is not guaranteed.
+- The task itself is not passed to callbacks; carry per-task data through `ctx` via `SubmitCtx`.
+- Register before the pool starts processing tasks: the hook set is read without synchronization on every dispatch. A custom implementation only needs the five methods of `agilepool.Hooks`.
 
 ## Benchmark
 

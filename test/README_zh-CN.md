@@ -1,119 +1,114 @@
+# agilepool 测试工具(插件式)
 
-## 测试工具（test/）
+go-agile-pool 的性能测试工具。完整设计文档与插件编写指南(英文)见
+[`docs/test-harness.md`](../../docs/test-harness.md);接入范例见
+[`example.go`](example.go)。English version: [`README.md`](README.md)。
 
-项目在 `test/` 目录下提供了一个独立测试入口包（`package main`），用于在实际运行场景下对 pool 进行基准测试、指标采集和性能分析。
+## 这是什么
 
-### 为什么编写独立的测试工具？
+旧实现把所有能力(池参数、任务模型、提交策略、插桩、采样、profiling)平铺在
+一个 main 里,靠短 flag 前缀(`-T`/`-U`/`-w`…)区分,歧义多、难组合。重构为
+**插件式子命令式**:每个能力是一个独立插件,宿主框架只做"切段、排依赖、按
+生命周期调度"。**新增能力 = 新增一个文件 + `plugins.go` 登记一行,框架零改动。**
 
-- 采集运行时的**内存、GC、goroutine、CPU**等系统级指标的时间变化
-- 对比不同池配置（容器类型、工作模式、worker 数量）对性能的影响
-- 输出 CSV/JSON，配合 `plot_csv.py` 或 `go tool pprof` 分析
-- 修改 `run_test.bat` / `run_test.sh` 即可快速更改参数
+## 已实现插件
 
-### 设计思路
+| 段 | 作用 | 关键选项(默认) | 生命周期 |
+|---|---|---|---|
+| `--pool` | 创建池并持有 | `workers`(20000) `queue`(10000) `container`(linkedlist) `mode`(block) `clean-period`(500ms) | Start 建池 / End `Close` |
+| `--task` | 任务时长模型 | `type`(fixed) `base`(10) `extra`(0) `mean`(10) `sigma`(5) | — |
+| `--submit` | 提交策略并等排空 | `strategy`(immediate) `num`(1000000) `interval`(10) `jitter`(0) `mean-interval`(50) `phases` `shards`(1) `submitters`(1) | — |
+| `--hook` | 事件插桩 | `mode`(none;hook 计数;trace 待上游追踪接线) | — |
+| `--metrics` | 周期采样 + 汇总 | `interval`(1s) `format`(csv) `file`(metrics.csv) `wait-exit`(0) | Start 起采样 / End 收尾拍+观察窗+汇总 |
+| `--profile` | pprof 包络会话 | `cpu`(false) `mem`(false) | Start 开 CPU / End 停 CPU+写 heap |
 
-任务时长生成（`--task-type`/`-T`）与提交控制（`--submit-type`/`-U`）解耦：
+### 钩子稳定性压测插件(`h*` 家族)
 
-| 任务类型 | 说明 |
-|---------|------|
-| `fixed` | 固定时长 `--task-base` ms |
-| `uniform` | `--task-base` + rand × `--task-extra` ms |
-| `normal` | N(`--task-mean`, `--task-sigma`) ms |
+每个插件都是独立场景:自建私有池、装上对抗性钩子、断言 PASS/FAIL 不变量
+(首个 FAIL 即退出码 1)。刻意不声明依赖,`--hcount` 可单独运行:
 
-| 提交类型 | 说明 |
-|---------|------|
-| `immediate` | 一次性全部提交 |
-| `linear` | `--submit-interval` + rand × `--submit-jitter` ms |
-| `constant` | 固定 `--submit-interval` ms |
-| `poisson` | 平均间隔 `--submit-mean-interval` ms |
-| `phased` | 多阶段突发：`-P "offset,dur,rate;..."` |
+| 段 | 施压场景 | 关键选项(默认) |
+|---|---|---|
+| `--hcount` | 精确计数:N 个钩子 × M 个任务,事件不丢不重 | `num`(20000) `hooks`(8) `workers`(1000) |
+| `--hpanic` | 钩子 panic 不得击穿提交/执行/Close 路径 | `num`(3000) `level`(dispatch/callback) `stage`(all/…) |
+| `--horder` | 单任务事件序(Submitted 首、Started 先于 Completed)+ ctx 载荷 + panic 值透传 | `num`(20000) `panics`(2000) `workers`(1000) |
+| `--hctx` | ctx 载荷贯穿全事件;预取消与排队中取消语义 | `num`(3000) `queued`(150) |
+| `--hblock` | 慢/阻塞钩子不得死锁或丢事件 | `num`(5000) `delay-us`(200) `workers`(200) |
+| `--hchurn` | 分发前多协程并发注册风暴(契约窗口),精确记账 | `num`(10000) `num2`(5000) `churners`(4) `adds`(25) |
+| `--hreenter` | 重入分发:钩子内再提交新任务 | `num`(2000) `budget`(2000) `depth`(32) `stage`(submitted/completed) |
+| `--hclose` | OnPoolClosed 恰好一次(含并发 Close)+ 关闭后静默 | `num`(2000) `closers`(4) |
+| `--henqueue` | 溢出缓冲路径上的 Enqueued 精确记账(queue << num)、慢钩子与重入钩子 | `num`(2000) `reenter`(500) `workers`(1) `queue`(2) `delay-us`(50) `submitters`(1) `rtask-us`(100) `attempts`(8) |
 
-### 使用方式
+submit 策略:immediate / linear / constant / poisson / phased;任务时长类型:
+fixed / uniform / normal。依赖关系:`submit ← pool+task`,`hook ← pool`,
+`metrics ← pool`,漏写依赖段时宿主按默认参数自动补全(如只写 `--submit`
+会自动带出 pool/task),依赖乱序/重复段/成环都会以退出码 2 报错。
 
-```bash
-cd test
-go build -o agilepool_test.exe .
-agilepool_test.exe -T fixed --task-base 500 -U immediate -t 200000 -w 10000 -i 1 -f csv
+## 快速使用
+
+```text
+# 查看插件与帮助
+go run . --list
+go run . --help submit
+
+# 一个完整基准场景(hook 计数会带进 metrics 采样行)
+go run . --pool workers=20000 queue=10000 \
+         --task type=fixed base=500 \
+         --hook mode=hook \
+         --submit strategy=immediate num=200000 \
+         --metrics interval=1 format=csv file=out.csv
 ```
 
-也可直接运行 `run_test.bat` 或 `run_test.sh`。
+全场景回归脚本(等价旧 run_test,场景逐行对应、输出文件名沿用旧自动命名):
 
-### 命令行参数
-
-| 参数 | 短形式 | 默认值 | 说明 |
-|------|--------|--------|------|
-| `--workers` | `-w` | `20000` | 最大 worker 数 |
-| `--tasks` | `-t` | `1000000` | 提交任务总数 |
-| `--clean-period` | | `500ms` | 空闲 worker 清理周期 |
-| `--queue-size` | | `10000` | 任务队列大小提示 |
-| `--container` | `-c` | `linkedlist` | 空闲容器类型 |
-| `--mode` | `-m` | `block` | 工作模式 |
-| `--task-type` | `-T` | `fixed` | 任务时长类型 |
-| `--task-base` | | `10` | 基准时长（ms） |
-| `--task-extra` | | `0` | 随机范围（ms, uniform） |
-| `--task-mean` | | `10` | 正态均值（ms） |
-| `--task-sigma` | | `5` | 正态标准差（ms） |
-| `--submit-type` | `-U` | `immediate` | 提交模式 |
-| `--submit-interval` | | `10` | 提交间隔（ms） |
-| `--submit-jitter` | | `0` | 随机抖动（ms, linear） |
-| `--submit-mean-interval` | | `50` | 泊松平均间隔（ms） |
-| `--submit-phases` | `-P` | `""` | 多阶段编排（phased） |
-| `--submit-shards` | | `1` | 并行分片数 |
-| `--take-time` | `-i` | `0` | 采集间隔秒数（0=禁用） |
-| `--log-file` | `-o` | 自动 | 输出路径 |
-| `--log-format` | `-f` | `csv` | 输出格式 |
-| `--cpuprofile` | | `false` | CPU profiling |
-| `--memprofile` | | `false` | Memory profiling |
-| `--wait-exit` | `-e` | `0` | 退出前额外等待秒数 |
-
-### 指标采集
-
-当 `-i` > 0 时启动后台协程，按间隔采集以下字段：
-
-| CSV 列 | 来源 | 说明 |
-|--------|------|------|
-| `run_sec` | `time.Since(start).Seconds()` | 运行秒数 |
-| `goroutines` | `runtime.NumGoroutine()` | goroutine 数 |
-| `heap_alloc_mb` | `memStats.Alloc` | 当前堆分配（MB） |
-| `total_alloc_mb` | `memStats.TotalAlloc` | 累计分配（MB） |
-| `sys_mb` | `memStats.Sys` | 系统内存（MB） |
-| `gc_total` | `memStats.NumGC` | GC 总次数 |
-| `gc_pause_total_ms` | `PauseTotalNs / 1e6` | GC 暂停总耗时（ms） |
-| `gc_pause_avg_ms` | 总耗时 / 次数 | GC 平均暂停（ms） |
-| `gc_cpu_pct` | `GCCPUFraction * 100` | GC CPU 占比（%） |
-| `last_gc_sec` | `(LastGC - start) / 1e9` | 上次 GC 时间（秒） |
-| `next_gc_mb` | `memStats.NextGC` | 下次 GC 阈值（MB） |
-| `workers_running` | `pool.GetRunningWorkersNum()` | 运行中 worker |
-| `workers_idle` | `pool.GetIdleWorkerCount()` | 空闲 worker |
-| `workers_created` | `pool.GetWorkerCreateCount()` | 累计创建 worker |
-| `task_queue_len` | `pool.GetTaskQueueLen()` | 队列长度 |
-| `cpu_pct` | `gopsutil cpu.Percent` | CPU 使用率（%） |
-
-### 绘图
-
-```bash
-python plot_csv.py
-```
-
-扫描 `metrics_*.csv` 生成 PNG 折线图。
-
-### 三段式退出
-
-1. 轮询至所有 worker 空闲
-2. 等待一个采集周期完成最终写入
-3. 若有 `--wait-exit`，等待额外秒数
-
-### 性能分析
-
-```bash
-agilepool_test.exe -T fixed --task-base 500 -U immediate -t 500000 -w 20000 --cpuprofile --memprofile -i 1 -f csv
-go tool pprof -http=:8080 cpu_profile.prof
-go tool pprof -http=:8080 mem_profile.prof
-```
-
-### 一键运行
-
-```bash
+```text
 run_test.bat        # Windows
-./run_test.sh       # Linux/macOS
+run_test.sh         # Linux/macOS
+run_hook_stress.bat # Windows:跑全部 h* 钩子稳定性场景
+run_hook_stress.sh  # Linux/macOS:同;run_hook_stress.* race -> -race 构建
 ```
+
+`test/` 是独立 Go 模块(`github.com/Yiming1997/agilePool/v2/test`),
+`replace` 把 `github.com/Yiming1997/agilePool/v2` 指到仓库根目录,工具始终
+编译本地库、绝不下发网络版本。
+
+## 约定速览
+
+- 段头 = 命中注册插件名的 `--xxx`,任意位置开新段;段内参数**按原顺序原样透传**
+  给插件自解析(`-T fixed --task-base 500` 这类 flag 写法可用),也支持
+  `key=value`(框架提供 `ParseOptions`/`GetInt`/`GetDuration`/`GetBool`/`GetFloat`);
+- 生命周期:Start(全会话前,按序,带本段参数)→ Run(逐段)→ End(逆序收尾);
+  出错即中止但已 Start 的段仍逆序 End;
+- 插件间只经共享 Store 交换**会话级对象**(池句柄/配置/工厂);每任务级计数留在
+  插件自身原子状态,metrics 采样时按句柄直接读数——共享表不进热路径;
+- 退出码:0 成功 / 1 运行错误 / 2 用法错误;错误带 `[插件名]` 前缀;
+- 命令行分析、执行模型、数据列与旧格式的对照等细节见
+  [`docs/test-harness.md`](../../docs/test-harness.md)。
+
+## 目录
+
+```text
+docs/test-harness.md  设计文档 + 插件编写指南(英文,仓库根 docs/)
+test/
+  README.md        本文档英文版
+  README_zh-CN.md  本文档(中文)
+  main.go          宿主:切段/规划/生命周期调度/帮助
+  plugin.go        接口(Plugin/Optioned/Lifecycle/Depender)+ Runtime
+  option.go        key=value 解析与类型化取值
+  store.go         会话级共享 Store(Provide/Get/Require)
+  registry.go      注册表(重名/依赖注册校验)
+  plan.go          依赖规划(自动补全/顺序/环检测)
+  cli.go           段切割 + --list/--help
+  plugins.go       集中注册表
+  example.go       演示插件 provider/consumer(默认不注册)
+  pool.go ...      六个正式插件(一文件一插件)
+  hookcheck.go     h* 稳定性家族共用机制
+  hcount.go ...    九个 h* 钩子稳定性插件(h*.go,一文件一插件)
+  run_test.bat     Windows 回归脚本(新语法)
+  run_test.sh      Linux/macOS 回归脚本(与 bat 同场景)
+  run_hook_stress.bat/.sh  钩子稳定性场景脚本(可带 `race` 参数)
+  plot_csv.py      将 metrics_*.csv 画成每个文件一份 SVG(在结果目录运行)
+```
+
+代码注释为英文,与库内其他包风格一致;设计文档 `docs/test-harness.md` 为
+英文,本 README 提供中英双语。

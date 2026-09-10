@@ -100,7 +100,7 @@ type Pool struct {
 	consumeHist *histogram // consume count distribution per window
 	exitHist    *histogram // exit count distribution per window
 
-	hooks hooks // lifecycle callbacks registered via OnTaskSubmitted etc.
+	hooks Hooks // lifecycle callbacks registered via SetHook
 }
 
 func NewPool(c *Config) *Pool {
@@ -217,13 +217,11 @@ func (p *Pool) submit(ctx context.Context, task Task) bool {
 		}
 	}
 	hookCtx := context.Background()
-	hookTask := task
 	if wrapped, ok := task.(*contextTask); ok {
 		hookCtx = wrapped.ctx
-		hookTask = wrapped.task
 	}
-	p.dispatchHook(func(h hooks) {
-		h.DispatchTaskSubmitted(hookCtx, hookTask)
+	p.dispatchHook(func(h Hooks) {
+		h.DispatchTaskSubmitted(hookCtx)
 	})
 	if p.config.workMode == NONBLOCK {
 		select {
@@ -246,7 +244,6 @@ func (p *Pool) submit(ctx context.Context, task Task) bool {
 	result := p.taskBuf.PushAndForward(task, func(t Task) bool {
 		select {
 		case p.taskQueue <- t:
-			p.dispatchTaskEnqueuedFor(t)
 			return true
 		default:
 			return false
@@ -274,6 +271,14 @@ func (p *Pool) submit(ctx context.Context, task Task) bool {
 			return false
 		}
 	default:
+		// taskBufferAccepted: the task now lives in the overflow buffer, so
+		// it is enqueued in the pool's sense and must fire Enqueued exactly
+		// once. Dispatch after PushAndForward returned, i.e. outside the
+		// buffer lock, so a slow or reentrant callback cannot stall buffer
+		// access or self-deadlock on taskMu. The trade off is ordering: a
+		// worker may already have consumed the task, so Enqueued can be
+		// observed after Started (and, rarely, after Completed).
+		p.dispatchTaskEnqueuedFor(task)
 		return true
 	}
 }
@@ -282,10 +287,9 @@ func (p *Pool) dispatchTaskEnqueuedFor(task Task) {
 	ctx := context.Background()
 	if wrapped, ok := task.(*contextTask); ok {
 		ctx = wrapped.ctx
-		task = wrapped.task
 	}
-	p.dispatchHook(func(h hooks) {
-		h.DispatchTaskEnqueued(ctx, task)
+	p.dispatchHook(func(h Hooks) {
+		h.DispatchTaskEnqueued(ctx)
 	})
 }
 
@@ -536,7 +540,7 @@ func (p *Pool) Close() {
 	p.taskBuf.Close()
 
 	close(p.closePoolCn)
-	p.dispatchHook(func(h hooks) {
+	p.dispatchHook(func(h Hooks) {
 		h.DispatchPoolClosed(p) // fire OnPoolClosed hooks
 	})
 }
@@ -591,17 +595,21 @@ func (p *Pool) GetCapacity() int64 {
 	return p.capacity
 }
 
-func (p *Pool) SetHook(hooks hooks) error {
+// SetHook installs the lifecycle callback dispatcher. Register callbacks
+// before the pool starts processing tasks: the hook set is read without
+// synchronization by every dispatch path, so replacing it while tasks are in
+// flight is a data race. A nil set disables hook dispatch.
+func (p *Pool) SetHook(hooks Hooks) error {
 	p.hooks = hooks
 	return nil
 }
 
 // dispatchHook invokes fn with the pool's hook set and absorbs any panic a
-// hooks implementation raises. internal/hook.Hooks already recovers each
-// registered callback; this guard additionally keeps a custom implementation
-// that panics mid-dispatch from crashing the submitting goroutine, a worker,
-// or Close, and from skipping pool bookkeeping such as wg.Done.
-func (p *Pool) dispatchHook(fn func(h hooks)) {
+// hooks implementation raises. hook.Hooks already recovers each registered
+// callback; this guard additionally keeps a custom implementation that panics
+// mid-dispatch from crashing the submitting goroutine, a worker, or Close,
+// and from skipping pool bookkeeping such as wg.Done.
+func (p *Pool) dispatchHook(fn func(h Hooks)) {
 	if p.hooks == nil {
 		return
 	}

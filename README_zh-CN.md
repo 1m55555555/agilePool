@@ -30,6 +30,7 @@
 - **带超时的提交** — `SubmitBefore` 设定执行截止时间。
 - **优雅关闭** — `Wait` 等待所有运行中任务完成；`Close` 停止接收新任务。
 - **自定义 Logger** — 可接入任何实现了 `Printf`/`Println` 的日志库（如 `zap.SugaredLogger`）。
+- **生命周期钩子** — `hook.NewHooks()` 分发 Submitted / Enqueued / Started / Completed / PoolClosed 回调；回调 panic 会被隔离并记录日志。
 
 ## 安装
 
@@ -247,6 +248,35 @@ pool.Wait()
 pool.SetLogger(log.Default())       // 标准库
 pool.SetLogger(zapLogger.Sugar())   // zap
 ```
+
+## 生命周期钩子
+
+`hook` 包提供五类生命周期事件的默认分发器。请在提交任务前注册回调，然后通过 `SetHook` 安装：
+
+```go
+import (
+	"context"
+
+	agilepool "github.com/Yiming1997/agilePool/v2"
+	"github.com/Yiming1997/agilePool/v2/hook"
+)
+
+h := hook.NewHooks()
+h.AddTaskSubmitted(func(ctx context.Context) { /* 已提交 */ })
+h.AddTaskEnqueued(func(ctx context.Context)  { /* 已入队 */ })
+h.AddTaskStarted(func(ctx context.Context)   { /* 已开始 */ })
+h.AddTaskCompleted(func(ctx context.Context, recovered any) {
+	// 正常结束为 nil，否则为 panic 传入的值。
+})
+h.AddPoolClosed(func(p *agilepool.Pool) { /* 池已关闭 */ })
+pool.SetHook(h)
+```
+
+- 回调在触发事件的 goroutine 中执行：`Submitted`/`Enqueued` 在提交方，`Started`/`Completed` 在 worker，`PoolClosed` 在 `Close` 调用方。
+- 回调 panic 会被 recover 并记录日志，同一事件的其余回调不受影响。
+- `Enqueued` 对每个被接受的任务恰好触发一次。溢出缓冲路径下它在缓冲锁释放后派发，因此可能晚于 `Started`（甚至 `Completed`）被观察到；生命周期事件之间的顺序不做保证。
+- 回调不再接收 Task 本身，按任务携带数据请用 `SubmitCtx` 写入 ctx。
+- 必须在池开始处理任务前注册：每次分发都会无同步地读取钩子集合。自定义实现只需满足 `agilepool.Hooks` 的五个方法。
 
 ## 基准测试
 

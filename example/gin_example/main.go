@@ -8,7 +8,7 @@ import (
 	"time"
 
 	agilepool "github.com/Yiming1997/agilePool/v2"
-	hook "github.com/Yiming1997/agilePool/v2/internal/hook"
+	hook "github.com/Yiming1997/agilePool/v2/hook"
 	"github.com/gin-gonic/gin"
 )
 
@@ -20,24 +20,25 @@ var pool = agilepool.NewPool(agilepool.NewConfig(
 	agilepool.WithWorkerNumCapacity(8),
 ))
 
-// A newly-created Pool has hooks == nil, so hooks are disabled. Registering
-// any non-nil callback enables hook dispatch for that Pool.
+// A newly-created Pool has no hook dispatcher, so hooks are disabled.
+// SetHook enables them.
 var taskStartTimes sync.Map
 
 func main() {
 	defer pool.Close()
 
-	// Register callbacks before submitting tasks. Hook callbacks run in the
-	// submitting goroutine, worker goroutine, or Close caller as appropriate.
-	// The registration calls are shown above because this version does not yet
-	// expose them on agilepool.Pool.
-	var hook = hook.NewHooks()
-	hook.AddTaskSubmitted(onSubmitted)
-	hook.AddTaskEnqueued(onEnqueued)
-	hook.AddTaskStarted(onStarted)
-	hook.AddTaskCompleted(onCompleted)
-	hook.AddPoolClosed(onPoolClosed)
-	pool.SetHook(hook)
+	// Register callbacks before submitting tasks: the hook set is read
+	// without synchronization by every dispatch path. Hook callbacks run in
+	// the submitting goroutine, a worker goroutine, or the Close caller as
+	// appropriate. hook.NewHooks is the bundled dispatcher; a custom
+	// implementation only needs agilepool.Hooks' five dispatch methods.
+	h := hook.NewHooks()
+	h.AddTaskSubmitted(onSubmitted)
+	h.AddTaskEnqueued(onEnqueued)
+	h.AddTaskStarted(onStarted)
+	h.AddTaskCompleted(onCompleted)
+	h.AddPoolClosed(onPoolClosed)
+	pool.SetHook(h)
 	r := gin.Default()
 	r.Use(PoolMiddleware)
 	// This example shows how to limit concurrency for incoming requests.
@@ -45,15 +46,15 @@ func main() {
 	_ = r.Run("127.0.0.1:8080")
 }
 
-func onSubmitted(ctx context.Context, task agilepool.Task) {
-	log.Printf("task submitted task=%T", task)
+func onSubmitted(ctx context.Context) {
+	log.Printf("task submitted")
 }
 
-func onEnqueued(ctx context.Context, task agilepool.Task) {
-	log.Printf("task enqueued task=%T", task)
+func onEnqueued(ctx context.Context) {
+	log.Printf("task enqueued")
 }
 
-func onStarted(ctx context.Context, task agilepool.Task) {
+func onStarted(ctx context.Context) {
 	if c, ok := ctx.(*gin.Context); ok {
 		traceID, _ := c.Get("traceID")
 		taskStartTimes.Store(traceID, time.Now())
@@ -61,7 +62,7 @@ func onStarted(ctx context.Context, task agilepool.Task) {
 	}
 }
 
-func onCompleted(ctx context.Context, task agilepool.Task, recovered any) {
+func onCompleted(ctx context.Context, recovered any) {
 	if c, ok := ctx.(*gin.Context); ok {
 		traceID, _ := c.Get("traceID")
 		if started, exists := taskStartTimes.LoadAndDelete(traceID); exists {

@@ -119,10 +119,8 @@ func (w *worker) runTask(task Task) {
 	defer w.pool.done()
 
 	hookCtx := context.Background()
-	hookTask := task
 	if wrapped, ok := task.(*contextTask); ok {
 		hookCtx = wrapped.ctx
-		hookTask = wrapped.task
 	}
 
 	// Capture task panics so the Completed hook can observe the recovered
@@ -134,13 +132,13 @@ func (w *worker) runTask(task Task) {
 			recovered = p
 			w.pool.logger.Printf("worker exits from panic: %v\n%s\n", p, Stack(1))
 		}
-		w.pool.dispatchHook(func(h hooks) {
-			h.DispatchTaskCompleted(hookCtx, hookTask, recovered)
+		w.pool.dispatchHook(func(h Hooks) {
+			h.DispatchTaskCompleted(hookCtx, recovered)
 		})
 	}()
 
-	w.pool.dispatchHook(func(h hooks) {
-		h.DispatchTaskStarted(hookCtx, hookTask)
+	w.pool.dispatchHook(func(h Hooks) {
+		h.DispatchTaskStarted(hookCtx)
 	})
 	task.process()
 }

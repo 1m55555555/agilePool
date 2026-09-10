@@ -9,7 +9,7 @@ import (
 
 // panicHooks is a hooks implementation that deliberately panics at selected
 // lifecycle points. It mimics a custom hooks implementation that does not
-// recover its own callbacks (the bundled internal/hook.Hooks does).
+// recover its own callbacks (the bundled hook.Hooks does).
 type panicHooks struct {
 	panicSubmitted  bool
 	panicEnqueued   bool
@@ -18,25 +18,25 @@ type panicHooks struct {
 	panicPoolClosed bool
 }
 
-func (h *panicHooks) DispatchTaskSubmitted(context.Context, Task) {
+func (h *panicHooks) DispatchTaskSubmitted(context.Context) {
 	if h.panicSubmitted {
 		panic("submitted hook panic")
 	}
 }
 
-func (h *panicHooks) DispatchTaskEnqueued(context.Context, Task) {
+func (h *panicHooks) DispatchTaskEnqueued(context.Context) {
 	if h.panicEnqueued {
 		panic("enqueued hook panic")
 	}
 }
 
-func (h *panicHooks) DispatchTaskStarted(context.Context, Task) {
+func (h *panicHooks) DispatchTaskStarted(context.Context) {
 	if h.panicStarted {
 		panic("started hook panic")
 	}
 }
 
-func (h *panicHooks) DispatchTaskCompleted(context.Context, Task, any) {
+func (h *panicHooks) DispatchTaskCompleted(context.Context, any) {
 	if h.panicCompleted {
 		panic("completed hook panic")
 	}
