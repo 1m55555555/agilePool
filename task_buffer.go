@@ -54,9 +54,9 @@ func (b *chunkedTaskBuffer) Close() {
 	b.overflowClosed = true
 }
 
-// PushAndForward appends task to the buffer, then tries to forward one
-// buffered task through tryForward. If forwarding fails, the task is pushed
-// back to the buffer tail.
+// PushAndForward appends task to the buffer, then tries to forward the oldest
+// buffered task through tryForward. A failed forward leaves that task at the
+// head, preserving FIFO order while the handoff channel is saturated.
 func (b *chunkedTaskBuffer) PushAndForward(task Task, tryForward func(Task) bool) taskBufferPushResult {
 	b.taskMu.Lock()
 	defer b.taskMu.Unlock()
@@ -70,13 +70,48 @@ func (b *chunkedTaskBuffer) PushAndForward(task Task, tryForward func(Task) bool
 
 	b.pushTail(task)
 
-	if t, ok := b.popHead(); ok {
-		if !tryForward(t) {
-			b.pushTail(t)
-		}
+	if t, ok := b.peekHead(); ok && tryForward(t) {
+		// popHead cannot fail here: taskMu is held and peekHead just observed
+		// the same head task. Remove only after a successful handoff so a
+		// failed handoff never moves an older task behind newer submissions.
+		b.popHead()
 	}
 
 	return taskBufferAccepted
+}
+
+// peekHead returns the task at the head of the buffer without removing it.
+// Must be called with taskMu held.
+func (b *chunkedTaskBuffer) peekHead() (Task, bool) {
+	if b.headChunk == nil {
+		return nil, false
+	}
+	if b.headIdx >= taskChunkSize {
+		// Advance to next chunk; recycle the exhausted one.
+		next := b.headChunk.next
+		b.headChunk.next = nil
+		b.chunkPool.Put(b.headChunk)
+		b.headChunk = next
+		b.headIdx = 0
+		if b.headChunk == nil {
+			b.tailChunk = nil
+			b.tailIdx = 0
+			return nil, false
+		}
+	}
+
+	// Head caught up to tail in the same chunk - queue drained.
+	if b.headChunk == b.tailChunk && b.headIdx >= b.tailIdx {
+		b.headChunk.next = nil
+		b.chunkPool.Put(b.headChunk)
+		b.headChunk = nil
+		b.tailChunk = nil
+		b.headIdx = 0
+		b.tailIdx = 0
+		return nil, false
+	}
+
+	return b.headChunk.tasks[b.headIdx], true
 }
 
 func (b *chunkedTaskBuffer) PopBatch(dst []Task) int {
@@ -121,35 +156,10 @@ func (b *chunkedTaskBuffer) pushTail(task Task) {
 // Returns nil, false if the buffer is empty.
 // Must be called with taskMu held.
 func (b *chunkedTaskBuffer) popHead() (Task, bool) {
-	if b.headChunk == nil {
+	task, ok := b.peekHead()
+	if !ok {
 		return nil, false
 	}
-	if b.headIdx >= taskChunkSize {
-		// Advance to next chunk; recycle the exhausted one.
-		next := b.headChunk.next
-		b.headChunk.next = nil
-		b.chunkPool.Put(b.headChunk)
-		b.headChunk = next
-		b.headIdx = 0
-		if b.headChunk == nil {
-			b.tailChunk = nil
-			b.tailIdx = 0
-			return nil, false
-		}
-	}
-
-	// Head caught up to tail in the same chunk - queue drained.
-	if b.headChunk == b.tailChunk && b.headIdx >= b.tailIdx {
-		b.headChunk.next = nil
-		b.chunkPool.Put(b.headChunk)
-		b.headChunk = nil
-		b.tailChunk = nil
-		b.headIdx = 0
-		b.tailIdx = 0
-		return nil, false
-	}
-
-	task := b.headChunk.tasks[b.headIdx]
 	b.headChunk.tasks[b.headIdx] = nil // help GC
 	b.headIdx++
 	b.chunkLen--
