@@ -84,33 +84,6 @@ func assertTaskIDs(tb testing.TB, tasks []Task, want []int) {
 	}
 }
 
-// assertTaskIDSet checks task conservation without making order part of the
-// contract. It is used when a failed forward is placed back into the buffer.
-func assertTaskIDSet(tb testing.TB, tasks []Task, want ...int) {
-	tb.Helper()
-
-	if len(tasks) != len(want) {
-		tb.Fatalf("got %d tasks, want %d", len(tasks), len(want))
-	}
-
-	wantCounts := make(map[int]int, len(want))
-	for _, id := range want {
-		wantCounts[id]++
-	}
-	for _, task := range tasks {
-		id := bufferTaskID(tb, task)
-		if wantCounts[id] == 0 {
-			tb.Fatalf("unexpected or duplicate task id %d", id)
-		}
-		wantCounts[id]--
-	}
-	for id, count := range wantCounts {
-		if count != 0 {
-			tb.Fatalf("task id %d is missing %d occurrence(s)", id, count)
-		}
-	}
-}
-
 // TestChunkedTaskBufferPushAndForward covers the successful fast path and the
 // failed-forward path, both with and without an existing backlog.
 func TestChunkedTaskBufferPushAndForward(t *testing.T) {
@@ -192,7 +165,7 @@ func TestChunkedTaskBufferPushAndForward(t *testing.T) {
 		assertTaskIDs(t, drainTaskBuffer(buffer), []int{2, 3})
 	})
 
-	t.Run("backlog forward failure preserves every task", func(t *testing.T) {
+	t.Run("backlog forward failure preserves FIFO order", func(t *testing.T) {
 		buffer := newChunkedTaskBuffer()
 		fillTaskBuffer(t, buffer, 1, 2)
 		callbackCalls := 0
@@ -213,9 +186,9 @@ func TestChunkedTaskBufferPushAndForward(t *testing.T) {
 		if forwardedID != 1 {
 			t.Fatalf("forwarded task id = %d, want oldest task 1", forwardedID)
 		}
-		// A failed task must remain available, but its exact requeue position is
-		// an implementation detail and is intentionally not asserted here.
-		assertTaskIDSet(t, drainTaskBuffer(buffer), 1, 2, 3)
+		// taskQueue is still full, so the oldest task must stay at the head
+		// rather than being requeued behind newer tasks.
+		assertTaskIDs(t, drainTaskBuffer(buffer), []int{1, 2, 3})
 	})
 }
 
