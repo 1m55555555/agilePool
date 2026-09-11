@@ -100,7 +100,16 @@ type Pool struct {
 	consumeHist *histogram // consume count distribution per window
 	exitHist    *histogram // exit count distribution per window
 
-	hooks Hooks // lifecycle callbacks registered via SetHook
+	// hooks holds an immutable snapshot wrapper. Dispatch only loads this
+	// pointer, while SetHook atomically publishes a replacement, so hook
+	// installation is safe while tasks are submitted or executed.
+	hooks atomic.Pointer[hookSnapshot]
+}
+
+// hookSnapshot wraps an interface so it can be atomically published. A
+// snapshot whose hooks field is nil explicitly disables lifecycle callbacks.
+type hookSnapshot struct {
+	hooks Hooks
 }
 
 func NewPool(c *Config) *Pool {
@@ -595,12 +604,11 @@ func (p *Pool) GetCapacity() int64 {
 	return p.capacity
 }
 
-// SetHook installs the lifecycle callback dispatcher. Register callbacks
-// before the pool starts processing tasks: the hook set is read without
-// synchronization by every dispatch path, so replacing it while tasks are in
-// flight is a data race. A nil set disables hook dispatch.
+// SetHook installs the lifecycle callback dispatcher. It is safe to call
+// while tasks are in flight: each lifecycle event uses the hook snapshot that
+// was current when its dispatch began. A nil set disables hook dispatch.
 func (p *Pool) SetHook(hooks Hooks) error {
-	p.hooks = hooks
+	p.hooks.Store(&hookSnapshot{hooks: hooks})
 	return nil
 }
 
@@ -610,7 +618,8 @@ func (p *Pool) SetHook(hooks Hooks) error {
 // mid-dispatch from crashing the submitting goroutine, a worker, or Close,
 // and from skipping pool bookkeeping such as wg.Done.
 func (p *Pool) dispatchHook(fn func(h Hooks)) {
-	if p.hooks == nil {
+	snapshot := p.hooks.Load()
+	if snapshot == nil || snapshot.hooks == nil {
 		return
 	}
 	defer func() {
@@ -618,5 +627,5 @@ func (p *Pool) dispatchHook(fn func(h Hooks)) {
 			p.logger.Printf("hook dispatch panicked: %v\n%s\n", r, Stack(1))
 		}
 	}()
-	fn(p.hooks)
+	fn(snapshot.hooks)
 }

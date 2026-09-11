@@ -2,6 +2,7 @@ package agilepool
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -161,4 +162,50 @@ func TestHookPoolClosedPanicDoesNotAbortClose(t *testing.T) {
 		t.Fatal("Wait() blocked")
 	}
 	p.Close() // must return normally despite the panicking hook
+}
+
+// TestSetHookConcurrentWithTaskDispatch verifies that replacing or disabling
+// a hook while Submit and worker dispatch paths are active is race-free. It
+// intentionally exercises Submitted, Enqueued, Started, and Completed.
+func TestSetHookConcurrentWithTaskDispatch(t *testing.T) {
+	p := NewPool(NewConfig(WithWorkerNumCapacity(8)))
+	defer p.Close()
+
+	const (
+		switches = 1_000
+		tasks    = 1_000
+	)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < switches; i++ {
+			if err := p.SetHook(&panicHooks{}); err != nil {
+				t.Errorf("SetHook() error = %v", err)
+				return
+			}
+			if err := p.SetHook(nil); err != nil {
+				t.Errorf("SetHook(nil) error = %v", err)
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < tasks; i++ {
+			p.Submit(TaskFunc(func() error { return nil }))
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	if !waitPoolDone(p, 5*time.Second) {
+		t.Fatal("Wait() blocked after concurrent SetHook and task dispatch")
+	}
 }
