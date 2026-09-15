@@ -92,6 +92,21 @@ func TestAgilePoolSubmitCtxCanceledBeforeSubmitDoesNotExecute(t *testing.T) {
 	assert.Equal(t, int64(0), atomic.LoadInt64(&executed))
 }
 
+func TestAgilePoolUpdateTaskNilContextRunsTask(t *testing.T) {
+	agilePool := agilepool.NewPool(agilepool.NewConfig())
+	agilePool.SetLogger(log.New(io.Discard, "", 0))
+	defer agilePool.Close()
+
+	var executed int64
+	agilePool.Submit(agilepool.UpdateTask(nil, agilepool.TaskFunc(func() error {
+		atomic.AddInt64(&executed, 1)
+		return nil
+	})))
+	agilePool.Wait()
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(&executed))
+}
+
 func TestAgilePoolSubmitCtxCanceledWhileQueuedSkipsTask(t *testing.T) {
 	agilePool := agilepool.NewPool(agilepool.NewConfig(
 		agilepool.WithWorkerNumCapacity(1),
