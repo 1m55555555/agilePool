@@ -298,7 +298,12 @@ type contextTask struct {
 	task Task
 }
 
+// UpdateTask wraps task with ctx so it can be submitted through Submit or
+// TrySubmit. A nil ctx uses context.Background, matching SubmitCtx.
 func UpdateTask(ctx context.Context, task Task) *contextTask {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &contextTask{ctx: ctx, task: task}
 }
 
