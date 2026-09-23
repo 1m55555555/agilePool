@@ -10,7 +10,6 @@ package dynamic
 import (
 	"context"
 	"log"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -26,6 +25,9 @@ type Hooks struct {
 	logger    log.Logger
 }
 
+// callbackSnapshot is one immutable generation of lifecycle callbacks.
+// Dispatch reads one snapshot for the entire event, while registrations
+// publish a new snapshot for later events.
 type callbackSnapshot struct {
 	taskSubmitted []agilepool.TaskHook
 	taskEnqueued  []agilepool.TaskHook
@@ -133,6 +135,9 @@ func (h *Hooks) DispatchPoolClosed(pool *agilepool.Pool) {
 	}
 }
 
+// snapshot returns the currently published callback generation. The nil
+// fallback keeps the zero value of Hooks safe; NewHooks always publishes an
+// initial empty snapshot.
 func (h *Hooks) snapshot() *callbackSnapshot {
 	if snapshot := h.snapshots.Load(); snapshot != nil {
 		return snapshot
@@ -140,6 +145,10 @@ func (h *Hooks) snapshot() *callbackSnapshot {
 	return &callbackSnapshot{}
 }
 
+// appendCallback returns a new callback slice. Plain append is deliberately
+// avoided because it may reuse spare capacity and mutate the backing array
+// of an already published snapshot, which lock-free dispatch depends on
+// never happening.
 func appendCallback[T any](callbacks []T, callback T) []T {
 	next := make([]T, len(callbacks)+1)
 	copy(next, callbacks)
@@ -147,10 +156,13 @@ func appendCallback[T any](callbacks []T, callback T) []T {
 	return next
 }
 
+// invoke runs one callback with per-callback panic recovery. A panicking
+// callback must not prevent the remaining callbacks of the same event from
+// running.
 func (h *Hooks) invoke(fn func(), name string) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			h.logger.Printf("hook %s panicked: %v\n%s \n", name, recovered, debug.Stack())
+			h.logger.Printf("hook %s panicked: %v\n%s \n", name, recovered, agilepool.Stack(2))
 		}
 	}()
 	fn()
